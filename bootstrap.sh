@@ -4,20 +4,24 @@ set -euo pipefail
 COMFY_DIR=/workspace/ComfyUI
 BOOTSTRAP_DIR=/workspace/bootstrap
 
+# Make git fail instead of prompting for credentials
+export GIT_TERMINAL_PROMPT=0
+
 # --- REQUIRED: where to fetch bootstrap package ---
-: "${BOOTSTRAP_GIT_URL:=https://github.com/Darkfirepro/comfy-bootstrap.git}"     # https://github.com/you/comfy-bootstrap.git OR git@github.com:...
+: "${BOOTSTRAP_GIT_URL:=https://github.com/Darkfirepro/comfy-bootstrap.git}"
 : "${BOOTSTRAP_BRANCH:=main}"
 
 # --- OPTIONAL: webapp repo (private) ---
-: "${WEBAPP_GIT_SSH_URL:=}"    # git@github.com:YOU/YOUR_WEBAPP.git
+: "${WEBAPP_GIT_SSH_URL:=}"     # git@github.com:YOU/YOUR_WEBAPP.git
 : "${WEBAPP_GIT_BRANCH:=main}"
 
 # --- OPTIONAL: GitHub SSH key (base64 private key) for private repos ---
 : "${GIT_SSH_KEY_B64:=}"
 
 # --- OPTIONAL: Models via HuggingFace ---
-: "${HF_ENABLE:=0}"            # set to 1 to enable HF download
-: "${HF_TRANSFER:=1}"          # speeds up downloads on many setups (optional)
+: "${HF_ENABLE:=0}"             # set to 1 to enable HF download
+: "${HF_TOKEN:=}"               # HF access token (DO NOT hardcode; pass via env)
+: "${HF_TRANSFER:=1}"           # speeds up downloads on many setups (optional)
 
 echo "==> [1/8] SSH setup (only if key provided)"
 if [[ -n "${GIT_SSH_KEY_B64}" ]]; then
@@ -72,10 +76,8 @@ else
   echo "WARNING: custom_nodes_snapshot.tgz not found, skipping snapshot restore"
 fi
 
-
-echo "==> Install custom nodes (repo + pinned commit) + deps"
+echo "==> [4/8] Install custom nodes (repo + pinned commit) + deps"
 mkdir -p "$COMFY_DIR/custom_nodes"
-
 python -m pip install -U pip
 
 if [[ -f "$BOOTSTRAP_DIR/custom_nodes.lock" ]]; then
@@ -94,12 +96,10 @@ if [[ -f "$BOOTSTRAP_DIR/custom_nodes.lock" ]]; then
     git -C "$target" checkout "$sha"
     git -C "$target" submodule update --init --recursive || true
 
-    # Install node-local requirements if they exist
     if [[ -f "$target/requirements.txt" ]]; then
       python -m pip install -r "$target/requirements.txt"
     fi
 
-    # Some nodes are python packages
     if [[ -f "$target/pyproject.toml" || -f "$target/setup.py" ]]; then
       python -m pip install -e "$target" || true
     fi
@@ -109,7 +109,6 @@ else
   echo "WARNING: custom_nodes.lock not found"
 fi
 
-# Optional: also install your merged requirements file as a catch-all
 if [[ -f "$BOOTSTRAP_DIR/custom_nodes_requirements.txt" ]]; then
   grep -viE '^(torch|xformers|triton)([=<> ].*)?$' "$BOOTSTRAP_DIR/custom_nodes_requirements.txt" \
     | python -m pip install -r /dev/stdin || true
@@ -117,8 +116,12 @@ fi
 
 echo "==> [6/8] Optional: Download models from HuggingFace"
 if [[ "${HF_ENABLE}" == "1" ]]; then
+  if [[ -z "${HF_TOKEN}" ]]; then
+    echo "ERROR: HF_ENABLE=1 but HF_TOKEN is empty. Set HF_TOKEN in env (do not commit it)."
+    exit 1
+  fi
+
   export HF_HOME=/workspace/.cache/huggingface
-  export HUGGINGFACE_HUB_TOKEN="${HF_TOKEN}"
   export HF_HUB_ENABLE_HF_TRANSFER="${HF_TRANSFER}"
 
   python -m pip install -U huggingface_hub hf_transfer >/dev/null 2>&1 || true
@@ -134,11 +137,15 @@ from huggingface_hub import snapshot_download
 COMFY = pathlib.Path("/workspace/ComfyUI/models")
 manifest = pathlib.Path("/workspace/bootstrap/models_hf.txt")
 
+token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+if not token:
+    raise SystemExit("HF token missing. Set HF_TOKEN in env.")
+
 def clean(line: str) -> str:
     return re.sub(r"\s+", "\t", line.strip())
 
+rows = []
 with manifest.open("r", encoding="utf-8") as f:
-    rows = []
     for raw in f:
         raw = raw.strip()
         if not raw or raw.startswith("#"):
@@ -160,6 +167,7 @@ for dest_subdir, repo_id, revision, allow_patterns in rows:
         local_dir=str(out_dir),
         local_dir_use_symlinks=False,
         allow_patterns=patterns,
+        token=token,   # IMPORTANT for private repos
     )
 PY
   fi
@@ -193,7 +201,6 @@ if ! command -v supervisorctl >/dev/null 2>&1; then
   exit 0
 fi
 
-# ---- If webapp is enabled, register it with supervisor ----
 if [[ -n "${WEBAPP_GIT_SSH_URL}" ]]; then
   echo "Setting up supervisor program: webapp"
 
@@ -209,19 +216,15 @@ stderr_logfile=/dev/stderr
 EOF
 fi
 
-# ---- Reload supervisor configs ----
 supervisorctl reread || true
 supervisorctl update || true
 supervisorctl status || true
 
-# ---- Restart ComfyUI so it reloads custom_nodes ----
-# Different Vast images name the program differently; try common names and fallback to pattern match.
 restart_comfy() {
   supervisorctl restart comfyui 2>/dev/null && return 0
   supervisorctl restart ComfyUI 2>/dev/null && return 0
   supervisorctl restart comfy 2>/dev/null && return 0
 
-  # fallback: find first program containing "comfy"
   local name
   name="$(supervisorctl status | awk '{print $1}' | grep -i comfy | head -n 1 || true)"
   if [[ -n "$name" ]]; then
@@ -234,7 +237,6 @@ restart_comfy() {
 echo "Restarting ComfyUI..."
 restart_comfy || echo "WARNING: Could not identify ComfyUI program name. Check 'supervisorctl status' and restart manually."
 
-# ---- Start/restart webapp if enabled ----
 if [[ -n "${WEBAPP_GIT_SSH_URL}" ]]; then
   echo "Restarting webapp..."
   supervisorctl restart webapp 2>/dev/null || supervisorctl start webapp 2>/dev/null || true
