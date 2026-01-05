@@ -16,7 +16,6 @@ BOOTSTRAP_DIR=/workspace/bootstrap
 : "${GIT_SSH_KEY_B64:=}"
 
 # --- OPTIONAL: Models via HuggingFace ---
-: "${HF_TOKEN:=}"              # your HF access token (read token is enough)
 : "${HF_ENABLE:=0}"            # set to 1 to enable HF download
 : "${HF_TRANSFER:=1}"          # speeds up downloads on many setups (optional)
 
@@ -243,5 +242,3 @@ fi
 
 supervisorctl status || true
 echo "Done."
-
-

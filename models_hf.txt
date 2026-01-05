@@ -3,5 +3,5 @@ diffusion_models        darkfirepro/ras_silk_ultimate       main        qwen_ima
 loras                   darkfirepro/ras_silk_ultimate       main        Qwen-Image-Edit-2511-Lightning-4steps-V1.0-fp32.safetensors
 vae                     darkfirepro/ras_silk_ultimate       main        qwen_image_vae.safetensors
 upscale_models          darkfirepro/ras_silk_ultimate       main        RealESRGAN_x4plus.safetensors
-loras                   darkfirepro/ras_silk_ultimate       main        rw_ras_silk_ultimate*.safetensors
+loras                   darkfirepro/ras_silk_ultimate       main        rw_ras_silk_ultimate_000004000.safetensors
 clip                    darkfirepro/ras_silk_ultimate       main        qwen_2.5_vl_7b_fp8_scaled.safetensors
