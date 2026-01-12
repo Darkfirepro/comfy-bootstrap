@@ -1,246 +1,215 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# Total time tracking starts here
+SECONDS=0 
+LOG_FILE="/workspace/setup_report.log"
+
+# Function to log with timestamp
+log_event() {
+    local msg="$1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $msg" | tee -a "$LOG_FILE"
+}
+
+# Use bash explicitly to ensure 'source' and other bash-specific features work
 set -euo pipefail
 
-COMFY_DIR=/workspace/ComfyUI
-BOOTSTRAP_DIR=/workspace/bootstrap
+log_event "==> [START] Beginning Blackwell Deployment on RTX 5090"
 
-# Make git fail instead of prompting for credentials
+# 1. Activate the official Blackwell-optimized environment
+source /venv/main/bin/activate
+log_event "Environment /venv/main activated."
+
+# 2. DEFINE CORRECT PATHS (vastai/comfy:v0.8.2 specific verified paths)
+COMFY_DIR=/opt/workspace-internal/ComfyUI  # Verified core path
+WEB_DIR=/workspace/webapp
+BOOTSTRAP_DIR=/workspace/bootstrap
 export GIT_TERMINAL_PROMPT=0
 
-# --- REQUIRED: where to fetch bootstrap package ---
-: "${BOOTSTRAP_GIT_URL:=https://github.com/Darkfirepro/comfy-bootstrap.git}"
-: "${BOOTSTRAP_BRANCH:=main}"
+log_event "==> [0/8] Environment check & Force Clean"
+# Force kill existing processes to free up GPU memory and ports
+pkill -9 python || true
+pkill -9 gunicorn || true
+log_event "Cleaned existing Python/Gunicorn processes."
 
-# --- OPTIONAL: webapp repo (private) ---
-: "${WEBAPP_GIT_SSH_URL:=}"     # git@github.com:YOU/YOUR_WEBAPP.git
+# --- Environment Variables (Defaults) ---
+: "${WEBAPP_GIT_SSH_URL:=}"
 : "${WEBAPP_GIT_BRANCH:=main}"
-
-# --- OPTIONAL: GitHub SSH key (base64 private key) for private repos ---
 : "${GIT_SSH_KEY_B64:=}"
+: "${HF_ENABLE:=1}"
+: "${HF_TOKEN:=}"
 
-# --- OPTIONAL: Models via HuggingFace ---
-: "${HF_ENABLE:=0}"             # set to 1 to enable HF download
-: "${HF_TOKEN:=}"               # HF access token (DO NOT hardcode; pass via env)
-: "${HF_TRANSFER:=1}"           # speeds up downloads on many setups (optional)
-
-echo "==> [1/8] SSH setup (only if key provided)"
+log_event "==> [1/8] SSH setup for Private Repos"
 if [[ -n "${GIT_SSH_KEY_B64}" ]]; then
-  SSH_DIR="${HOME}/.ssh"
-  mkdir -p "$SSH_DIR"
-  chmod 700 "$SSH_DIR"
-  echo "$GIT_SSH_KEY_B64" | tr -d '\r' | base64 -d > "$SSH_DIR/id_ed25519"
-  chmod 600 "$SSH_DIR/id_ed25519"
-  ssh-keyscan -t rsa,ed25519 github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
-  chmod 600 "$SSH_DIR/known_hosts"
-  cat > "$SSH_DIR/config" <<'EOF'
+    SSH_DIR="${HOME}/.ssh"
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+    echo "$GIT_SSH_KEY_B64" | tr -d '\r' | base64 -d > "$SSH_DIR/id_ed25519"
+    chmod 600 "$SSH_DIR/id_ed25519"
+    ssh-keyscan -t rsa,ed25519 github.com >> "$SSH_DIR/known_hosts" 2>/dev/null || true
+    chmod 600 "$SSH_DIR/known_hosts"
+    cat > "$SSH_DIR/config" <<EOF
 Host github.com
   HostName github.com
   User git
   IdentityFile ~/.ssh/id_ed25519
   IdentitiesOnly yes
 EOF
-  chmod 600 "$SSH_DIR/config"
+    chmod 600 "$SSH_DIR/config"
+    log_event "SSH keys configured."
 fi
 
-echo "==> [2/8] Clone/update bootstrap repo"
-if [[ -z "$BOOTSTRAP_GIT_URL" ]]; then
-  echo "ERROR: BOOTSTRAP_GIT_URL is not set"
-  exit 1
-fi
-
-if [[ -d "$BOOTSTRAP_DIR/.git" ]]; then
-  git -C "$BOOTSTRAP_DIR" fetch --all
-  git -C "$BOOTSTRAP_DIR" reset --hard "origin/$BOOTSTRAP_BRANCH"
+log_event "==> [2/8] Extracting Custom Nodes from Snapshot"
+# Check for the snapshot and extract it to the verified path
+SNAPSHOT="$BOOTSTRAP_DIR/custom_nodes_snapshot.tgz"
+if [[ -f "$SNAPSHOT" ]]; then
+    log_event "Found snapshot. Extracting to $COMFY_DIR/custom_nodes..."
+    mkdir -p "$COMFY_DIR/custom_nodes"
+    tar -xzf "$SNAPSHOT" -C "$COMFY_DIR/custom_nodes" --strip-components=1 || log_event "Snapshot extraction warning/error."
 else
-  rm -rf "$BOOTSTRAP_DIR"
-  git clone --depth 1 --branch "$BOOTSTRAP_BRANCH" "$BOOTSTRAP_GIT_URL" "$BOOTSTRAP_DIR"
+    log_event "No custom_nodes_snapshot.tgz found, skipping to git logic."
 fi
 
-echo "==> [3/8] Restore workflows + user settings"
-mkdir -p "$COMFY_DIR/user/default"
-if [[ -f "$BOOTSTRAP_DIR/workflows.tgz" ]]; then
-  tar -xzf "$BOOTSTRAP_DIR/workflows.tgz" -C "$COMFY_DIR/user/default" || true
-fi
-if [[ -f "$BOOTSTRAP_DIR/user_settings.tgz" ]]; then
-  tar -xzf "$BOOTSTRAP_DIR/user_settings.tgz" -C "$COMFY_DIR/user" || true
-fi
-if [[ -f "$BOOTSTRAP_DIR/extra_model_paths.yaml" ]]; then
-  cp "$BOOTSTRAP_DIR/extra_model_paths.yaml" "$COMFY_DIR/extra_model_paths.yaml"
-fi
-
-echo "==> [3.5/8] Restore custom_nodes snapshot (NO_GIT packs)"
-if [[ -f "$BOOTSTRAP_DIR/custom_nodes_snapshot.tgz" ]]; then
-  echo "Extracting $BOOTSTRAP_DIR/custom_nodes_snapshot.tgz -> /workspace/ComfyUI"
-  tar -xzf "$BOOTSTRAP_DIR/custom_nodes_snapshot.tgz" -C /workspace/ComfyUI
+# --- NEW: STEP 2.5 WORKFLOW BACKUP ---
+log_event "==> [2.5/8] Restoring workflows"
+WORKFLOW_BACKUP="$BOOTSTRAP_DIR/workflows.tgz"
+if [[ -f "$WORKFLOW_BACKUP" ]]; then
+    # We extract workflows into ComfyUI/user/default/workflows which is standard for the browser
+    # Alternatively, extracting to ComfyUI/input if they are images/templates
+    log_event "Found workflows.tgz. Extracting to $COMFY_DIR/user/default/workflows..."
+    mkdir -p "$COMFY_DIR/user/default/workflows"
+    tar -xzf "$WORKFLOW_BACKUP" -C "$COMFY_DIR/user/default/workflows"
 else
-  echo "WARNING: custom_nodes_snapshot.tgz not found, skipping snapshot restore"
+    log_event "No workflows.tgz found. Skipping workflow restoration."
 fi
 
-echo "==> [4/8] Install custom nodes (repo + pinned commit) + deps"
-mkdir -p "$COMFY_DIR/custom_nodes"
-python -m pip install -U pip
-
-if [[ -f "$BOOTSTRAP_DIR/custom_nodes.lock" ]]; then
-  while IFS=$'\t' read -r name url sha; do
-    [[ -z "${name:-}" ]] && continue
-
-    target="$COMFY_DIR/custom_nodes/$name"
-    echo "----> $name"
-
-    if [[ -d "$target/.git" ]]; then
-      git -C "$target" fetch --all
-    else
-      git clone "$url" "$target"
-    fi
-
-    git -C "$target" checkout "$sha"
-    git -C "$target" submodule update --init --recursive || true
-
-    if [[ -f "$target/requirements.txt" ]]; then
-      python -m pip install -r "$target/requirements.txt"
-    fi
-
-    if [[ -f "$target/pyproject.toml" || -f "$target/setup.py" ]]; then
-      python -m pip install -e "$target" || true
-    fi
-
-  done < "$BOOTSTRAP_DIR/custom_nodes.lock"
+log_event "==> [2.7/8] Restoring User Settings"
+SETTINGS_BACKUP="$BOOTSTRAP_DIR/user_settings.tgz"
+if [[ -f "$SETTINGS_BACKUP" ]]; then
+    # ComfyUI settings live in the 'user' folder (comfyui_settings.json, etc.)
+    log_event "Found user_settings.tgz. Extracting to $COMFY_DIR/user..."
+    mkdir -p "$COMFY_DIR/user"
+    tar -xzf "$SETTINGS_BACKUP" -C "$COMFY_DIR/user"
 else
-  echo "WARNING: custom_nodes.lock not found"
+    log_event "No user_settings.tgz found."
 fi
+
+log_event "==> [3/8] Custom Node Requirements & Missing Audio Libs"
+# We explicitly add soundfile here to prevent the comfyui-various crash
+pip install --no-cache-dir soundfile
 
 if [[ -f "$BOOTSTRAP_DIR/custom_nodes_requirements.txt" ]]; then
-  grep -viE '^(torch|xformers|triton)([=<> ].*)?$' "$BOOTSTRAP_DIR/custom_nodes_requirements.txt" \
-    | python -m pip install -r /dev/stdin || true
+    pip install --no-cache-dir -r "$BOOTSTRAP_DIR/custom_nodes_requirements.txt" || true
 fi
 
-echo "==> [6/8] Optional: Download models from HuggingFace"
+log_event "==> [4/8] Git Sync Custom Nodes from Lockfile"
+# Sync/Clone nodes that weren't in the snapshot or need updates
+mkdir -p "$COMFY_DIR/custom_nodes"
+if [[ -f "$BOOTSTRAP_DIR/custom_nodes.lock" ]]; then
+    cat "$BOOTSTRAP_DIR/custom_nodes.lock" | tr -d '\r' | while IFS=$'\t' read -r name url sha; do
+        [[ -z "${name:-}" ]] && continue
+        target="$COMFY_DIR/custom_nodes/$name"
+        log_event "----> Syncing: $name"
+        if [[ ! -d "$target/.git" ]]; then git clone "$url" "$target"; fi
+        git -C "$target" checkout "$sha"
+        if [[ -f "$target/requirements.txt" ]]; then
+            pip install --no-cache-dir -r "$target/requirements.txt" || true
+        fi
+    done
+fi
+
+log_event "==> [5/8] Solving Blackwell Dependency Conflicts"
+# Force Pillow >= 12.1.0 for rembg/silk stability and downgrade HF-hub for Transformers
+pip install --no-cache-dir "huggingface-hub<1.0" "pillow>=12.1.0"
+
+log_event "==> [6/8] Downloading Models (High Speed Blackwell Transfer)"
 if [[ "${HF_ENABLE}" == "1" ]]; then
-  if [[ -z "${HF_TOKEN}" ]]; then
-    echo "ERROR: HF_ENABLE=1 but HF_TOKEN is empty. Set HF_TOKEN in env (do not commit it)."
-    exit 1
-  fi
-
-  export HF_HOME=/workspace/.cache/huggingface
-  export HF_HUB_ENABLE_HF_TRANSFER="${HF_TRANSFER}"
-
-  python -m pip install -U huggingface_hub hf_transfer >/dev/null 2>&1 || true
-
-  MANIFEST="$BOOTSTRAP_DIR/models_hf.txt"
-  if [[ ! -f "$MANIFEST" ]]; then
-    echo "WARNING: $MANIFEST not found, skipping HF download"
-  else
+    pip install -U huggingface_hub hf_transfer >/dev/null 2>&1 || true
+    export HF_HUB_ENABLE_HF_TRANSFER=1
     python - <<'PY'
-import os, pathlib, re
+import os, pathlib
 from huggingface_hub import snapshot_download
-
-COMFY = pathlib.Path("/workspace/ComfyUI/models")
+COMFY_MODELS = pathlib.Path("/opt/workspace-internal/ComfyUI/models")
 manifest = pathlib.Path("/workspace/bootstrap/models_hf.txt")
+token = os.environ.get("HF_TOKEN")
 
-token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-if not token:
-    raise SystemExit("HF token missing. Set HF_TOKEN in env.")
-
-def clean(line: str) -> str:
-    return re.sub(r"\s+", "\t", line.strip())
-
-rows = []
-with manifest.open("r", encoding="utf-8") as f:
-    for raw in f:
-        raw = raw.strip()
-        if not raw or raw.startswith("#"):
-            continue
-        rows.append(clean(raw).split("\t"))
-
-print(f"Found {len(rows)} HF model entries")
-
-for dest_subdir, repo_id, revision, allow_patterns in rows:
-    out_dir = COMFY / dest_subdir
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    patterns = [allow_patterns] if allow_patterns and allow_patterns != "*" else None
-    print(f"Downloading {repo_id}@{revision} -> {out_dir} patterns={patterns}")
-
-    snapshot_download(
-        repo_id=repo_id,
-        revision=revision,
-        local_dir=str(out_dir),
-        local_dir_use_symlinks=False,
-        allow_patterns=patterns,
-        token=token,   # IMPORTANT for private repos
-    )
+with open(manifest, "r") as f:
+    for line in f:
+        if not line.strip() or line.startswith("#"): continue
+        parts = line.split()
+        if len(parts) < 4: continue
+        dest_subdir, repo_id, revision, filename = parts[0], parts[1], parts[2], parts[3]
+        target_dir = COMFY_MODELS / dest_subdir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        print(f"----> Downloading {filename} to {target_dir}...")
+        snapshot_download(repo_id=repo_id, revision=revision, allow_patterns=[filename],
+                          local_dir=str(target_dir), local_dir_use_symlinks=False, token=token)
 PY
-  fi
 fi
 
-echo "==> [7/8] Pull webapp + create venv (optional)"
+log_event "==> [7/8] Setting up Racing Cards webapp"
 if [[ -n "$WEBAPP_GIT_SSH_URL" ]]; then
-  WEB_DIR=/workspace/webapp
-  VENV_DIR=/workspace/venv_webapp
-
-  if [[ -d "$WEB_DIR/.git" ]]; then
-    git -C "$WEB_DIR" fetch --all
-    git -C "$WEB_DIR" reset --hard "origin/$WEBAPP_GIT_BRANCH"
-  else
-    rm -rf "$WEB_DIR"
-    git clone --depth 1 --branch "$WEBAPP_GIT_BRANCH" "$WEBAPP_GIT_SSH_URL" "$WEB_DIR"
-  fi
-
-  python -m venv "$VENV_DIR"
-  source "$VENV_DIR/bin/activate"
-  pip install -U pip
-  pip install -r "$WEB_DIR/requirements.txt"
-  pip install -U gunicorn
-  deactivate
+    if [[ ! -d "$WEB_DIR/.git" ]]; then
+        git clone --depth 1 --branch "$WEBAPP_GIT_BRANCH" "$WEBAPP_GIT_SSH_URL" "$WEB_DIR"
+    else
+        git -C "$WEB_DIR" pull
+    fi
+    pip install -r "$WEB_DIR/requirements.txt"
+    # Final force of stable versions
+    pip install "huggingface-hub<1.0" "pillow>=12.1.0" gunicorn
 fi
 
-echo "==> [8/8] Reload services via existing supervisor (ComfyUI + optional webapp)"
-
-if ! command -v supervisorctl >/dev/null 2>&1; then
-  echo "supervisorctl not found. Please restart the instance to reload nodes."
-  exit 0
-fi
-
-if [[ -n "${WEBAPP_GIT_SSH_URL}" ]]; then
-  echo "Setting up supervisor program: webapp"
-
-  cat > /etc/supervisor/conf.d/webapp.conf <<'EOF'
-[program:webapp]
-directory=/workspace/webapp
-command=/bin/bash -lc "/workspace/venv_webapp/bin/gunicorn -w 2 -b 0.0.0.0:8000 app:app --chdir /workspace/webapp"
+log_event "==> [8/8] Finalizing Supervisor Config"
+# 1. Jupyter on 1111
+cat > /etc/supervisor/conf.d/jupyter.conf <<EOF
+[program:jupyter]
+directory=/workspace
+command=/venv/main/bin/jupyter lab --ip 0.0.0.0 --port 1111 --no-browser --allow-root --NotebookApp.token='' --NotebookApp.password=''
 autostart=true
 autorestart=true
-startretries=3
 stdout_logfile=/dev/stdout
 stderr_logfile=/dev/stderr
 EOF
-fi
 
-supervisorctl reread || true
-supervisorctl update || true
-supervisorctl status || true
+# 2. ComfyUI (8188) - Aggressive Pathing
+cat > /etc/supervisor/conf.d/comfyui.conf <<EOF
+[program:comfyui]
+directory=$COMFY_DIR
+environment=LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64",PYTORCH_ALLOC_CONF="expandable_segments:True"
+command=/venv/main/bin/python $COMFY_DIR/main.py --listen 0.0.0.0 --port 8188 --disable-xformers --highvram
+autostart=true
+autorestart=true
+startsecs=10
+stdout_logfile=/dev/stdout
+stderr_logfile=/dev/stderr
+EOF
 
-restart_comfy() {
-  supervisorctl restart comfyui 2>/dev/null && return 0
-  supervisorctl restart ComfyUI 2>/dev/null && return 0
-  supervisorctl restart comfy 2>/dev/null && return 0
+# 3. Webapp on 8000
+cat > /etc/supervisor/conf.d/webapp.conf <<EOF
+[program:webapp]
+directory=$WEB_DIR
+command=/venv/main/bin/gunicorn -w 4 -b 0.0.0.0:8000 app:app
+autostart=true
+autorestart=true
+stdout_logfile=/dev/stdout
+stderr_logfile=/dev/stderr
+EOF
 
-  local name
-  name="$(supervisorctl status | awk '{print $1}' | grep -i comfy | head -n 1 || true)"
-  if [[ -n "$name" ]]; then
-    supervisorctl restart "$name" || true
-    return 0
-  fi
-  return 1
-}
+log_event "Starting Supervisor Daemon..."
+/usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+sleep 5
+supervisorctl update
 
-echo "Restarting ComfyUI..."
-restart_comfy || echo "WARNING: Could not identify ComfyUI program name. Check 'supervisorctl status' and restart manually."
+# FINAL LOGGING
+duration=$SECONDS
+minutes=$((duration / 60))
+seconds=$((duration % 60))
 
-if [[ -n "${WEBAPP_GIT_SSH_URL}" ]]; then
-  echo "Restarting webapp..."
-  supervisorctl restart webapp 2>/dev/null || supervisorctl start webapp 2>/dev/null || true
-fi
+log_event "==> [FINISH] Deployment Complete!"
+log_event "Total Setup Time: $minutes minutes and $seconds seconds."
 
-supervisorctl status || true
-echo "Done."
+echo "------------------------------------------------"
+echo "✅ SUCCESS: Your RTX 5090 is ready."
+echo "⏱️ Total Time: $minutes min $seconds sec"
+echo "------------------------------------------------"
+
+supervisorctl status
+tail -f /var/log/supervisor/supervisord.log
