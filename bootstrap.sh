@@ -135,7 +135,6 @@ export RCLONE_CONFIG_AWS_PROVIDER=AWS
 export RCLONE_CONFIG_AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
 export RCLONE_CONFIG_AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
 export RCLONE_CONFIG_AWS_REGION="ap-southeast-2"
-export RCLONE_CONFIG_AWS_ACL=private
 
 MANIFEST="$BOOTSTRAP_DIR/models_hf.txt"
 S3_BUCKET_NAME="comfy-models-ras" # Change this to your actual bucket name
@@ -152,8 +151,7 @@ if [[ -f "$MANIFEST" ]]; then
         log_event "----> Pulling from S3: $filename -> models/$dest_subdir"
         
         # rclone copy will check file size by default and skip if already present
-        # We assume your S3 structure is: s3://bucket/comfy-models/diffusion_models/file.safetensors
-        rclone copy "AWS:$S3_BUCKET_NAME/comfy-models/$dest_subdir/$filename" "$TARGET_DIR" \
+        rclone copy "AWS:$S3_BUCKET_NAME/$dest_subdir/$filename" "$TARGET_DIR" \
             --transfers 16 \
             --size-only \
             --stats-one-line
