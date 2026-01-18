@@ -172,14 +172,18 @@ EOF
 # 2. ComfyUI (8188) - Aggressive Pathing
 cat > /etc/supervisor/conf.d/comfyui.conf <<EOF
 [program:comfyui]
-directory=$COMFY_DIR
-environment=LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64",PYTORCH_ALLOC_CONF="expandable_segments:True"
-command=/venv/main/bin/python $COMFY_DIR/main.py --listen 0.0.0.0 --port 8188 --disable-xformers --highvram
+directory=/opt/workspace-internal/ComfyUI
+command=/venv/main/bin/python /opt/workspace-internal/ComfyUI/main.py --listen 0.0.0.0 --port 8188
 autostart=true
 autorestart=true
-startsecs=10
-stdout_logfile=/dev/stdout
-stderr_logfile=/dev/stderr
+startsecs=3
+startretries=50
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/var/log/supervisor/comfyui.stdout.log
+stderr_logfile=/var/log/supervisor/comfyui.stderr.log
+stdout_logfile_maxbytes=10MB
+stderr_logfile_maxbytes=10MB
 EOF
 
 # 3. Webapp on 8000
