@@ -118,32 +118,52 @@ fi
 
 log_event "==> [5/8] Solving Blackwell Dependency Conflicts"
 # Force Pillow >= 12.1.0 for rembg/silk stability and downgrade HF-hub for Transformers
-pip install --no-cache-dir "huggingface-hub<1.0" "pillow>=12.1.0"
+pip install --no-cache-dir "pillow>=12.1.0"
 
-log_event "==> [6/8] Downloading Models (High Speed Blackwell Transfer)"
-if [[ "${HF_ENABLE}" == "1" ]]; then
-    pip install -U huggingface_hub hf_transfer >/dev/null 2>&1 || true
-    export HF_HUB_ENABLE_HF_TRANSFER=1
-    python - <<'PY'
-import os, pathlib
-from huggingface_hub import snapshot_download
-COMFY_MODELS = pathlib.Path("/opt/workspace-internal/ComfyUI/models")
-manifest = pathlib.Path("/workspace/bootstrap/models_hf.txt")
-token = os.environ.get("HF_TOKEN")
+log_event "==> [6/8] Downloading Models (High Speed AWS S3 Transfer)"
 
-with open(manifest, "r") as f:
-    for line in f:
-        if not line.strip() or line.startswith("#"): continue
-        parts = line.split()
-        if len(parts) < 4: continue
-        dest_subdir, repo_id, revision, filename = parts[0], parts[1], parts[2], parts[3]
-        target_dir = COMFY_MODELS / dest_subdir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        print(f"----> Downloading {filename} to {target_dir}...")
-        snapshot_download(repo_id=repo_id, revision=revision, allow_patterns=[filename],
-                          local_dir=str(target_dir), local_dir_use_symlinks=False, token=token)
-PY
+# 1. Install rclone if missing
+if ! command -v rclone &> /dev/null; then
+    log_event "Installing rclone..."
+    curl https://rclone.org/install.sh | sudo bash >/dev/null 2>&1
 fi
+
+# 2. Configure AWS S3 for rclone using Environment Variables
+# These variables should be set in your Vast.ai Template settings
+export RCLONE_CONFIG_AWS_TYPE=s3
+export RCLONE_CONFIG_AWS_PROVIDER=AWS
+export RCLONE_CONFIG_AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+export RCLONE_CONFIG_AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+export RCLONE_CONFIG_AWS_REGION="ap-southeast-2"
+export RCLONE_CONFIG_AWS_ACL=private
+
+MANIFEST="$BOOTSTRAP_DIR/models_hf.txt"
+S3_BUCKET_NAME="comfy-models-ras" # Change this to your actual bucket name
+
+if [[ -f "$MANIFEST" ]]; then
+    # Parse the manifest line by line
+    while read -r dest_subdir repo_id revision filename || [ -n "$dest_subdir" ]; do
+        # Skip comments and empty lines
+        [[ "$dest_subdir" =~ ^#.*$ || -z "$dest_subdir" ]] && continue
+        
+        TARGET_DIR="$COMFY_DIR/models/$dest_subdir"
+        mkdir -p "$TARGET_DIR"
+        
+        log_event "----> Pulling from S3: $filename -> models/$dest_subdir"
+        
+        # rclone copy will check file size by default and skip if already present
+        # We assume your S3 structure is: s3://bucket/comfy-models/diffusion_models/file.safetensors
+        rclone copy "AWS:$S3_BUCKET_NAME/comfy-models/$dest_subdir/$filename" "$TARGET_DIR" \
+            --transfers 16 \
+            --size-only \
+            --stats-one-line
+            
+    done < "$MANIFEST"
+else
+    log_event "ERROR: $MANIFEST not found. Skipping model download."
+fi
+
+log_event "AWS S3 model sync complete."
 
 log_event "==> [7/8] Setting up Racing Cards webapp"
 if [[ -n "$WEBAPP_GIT_SSH_URL" ]]; then
