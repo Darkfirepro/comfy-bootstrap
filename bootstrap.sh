@@ -128,8 +128,9 @@ if ! command -v rclone &> /dev/null; then
     curl https://rclone.org/install.sh | sudo bash >/dev/null 2>&1
 fi
 
-# 2. Configure AWS S3 for rclone using Environment Variables
-# These variables should be set in your Vast.ai Template settings
+log_event "==> [6/8] Downloading Models (High Speed AWS S3 Transfer)"
+
+# 1. Configuration
 export RCLONE_CONFIG_AWS_TYPE=s3
 export RCLONE_CONFIG_AWS_PROVIDER=AWS
 export RCLONE_CONFIG_AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
@@ -137,31 +138,32 @@ export RCLONE_CONFIG_AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
 export RCLONE_CONFIG_AWS_REGION="ap-southeast-2"
 
 MANIFEST="$BOOTSTRAP_DIR/models_hf.txt"
-S3_BUCKET_NAME="comfy-models-ras" # Change this to your actual bucket name
+S3_BUCKET_NAME="comfy-models-ras"
 
 if [[ -f "$MANIFEST" ]]; then
-    # Parse the manifest line by line
-    while read -r dest_subdir repo_id revision filename || [ -n "$dest_subdir" ]; do
+    # Clean and read only TWO variables: dest_subdir and filename
+    cat "$MANIFEST" | tr -d '\r' | while read -r dest_subdir filename || [ -n "$dest_subdir" ]; do
+        
         # Skip comments and empty lines
         [[ "$dest_subdir" =~ ^#.*$ || -z "$dest_subdir" ]] && continue
         
         TARGET_DIR="$COMFY_DIR/models/$dest_subdir"
         mkdir -p "$TARGET_DIR"
         
-        log_event "----> Pulling from S3: $filename -> models/$dest_subdir"
+        log_event "----> Pulling: $filename into $dest_subdir"
         
-        # rclone copy will check file size by default and skip if already present
+        # Match your bucket structure: s3://comfy-models-ras/diffusion_models/file.safetensors
         rclone copy "AWS:$S3_BUCKET_NAME/$dest_subdir/$filename" "$TARGET_DIR" \
             --transfers 16 \
             --size-only \
-            --stats-one-line
+            --stats-one-line -P
             
-    done < "$MANIFEST"
+    done
 else
-    log_event "ERROR: $MANIFEST not found. Skipping model download."
+    log_event "ERROR: $MANIFEST not found at $BOOTSTRAP_DIR"
 fi
-
 log_event "AWS S3 model sync complete."
+
 
 log_event "==> [7/8] Setting up Racing Cards webapp"
 if [[ -n "$WEBAPP_GIT_SSH_URL" ]]; then
